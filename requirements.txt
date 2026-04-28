@@ -1,0 +1,12 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+xgboost>=2.0.3
+scikit-learn>=1.4.2
+pandas>=2.2.2
+numpy>=1.26.4
+python-dotenv==1.0.1
+pydantic==2.7.1
+pydantic-settings==2.2.1
+# Ensemble model dependencies (optional — loaded if available)
+lightgbm>=4.3.0
+catboost>=1.2.0

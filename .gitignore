@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+# Generated / retrained artefacts (run scripts/train.py or scripts/sync_models.py to regenerate)
+models/flood_model.pkl
+models/scaler.pkl
+# Keep FYP-RainfallView source models tracked (they are checked in via sync_models.py)
+models/flood_model_xgc_v2.pkl
+models/flood_model_lgbmc.pkl
+models/flood_model_cboost.pkl
+models/*.joblib
+models/*.h5
+*.csv
+.venv/
+venv/
+dist/
+*.egg-info/
+.pytest_cache/
