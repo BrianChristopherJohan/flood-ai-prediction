@@ -1,10 +1,18 @@
 from fastapi import APIRouter, Query
 from app.model import predict_flood_risk, FEATURES, is_model_loaded, get_registry_status
-from app.schemas import NodePredictRequest, NodePredictResponse
+from app.schemas import (
+    BatchNodePrediction,
+    BatchNodesPredictRequest,
+    BatchNodesPredictResponse,
+    NodePredictRequest,
+    NodePredictResponse,
+    WeatherScenario,
+)
 import pandas as pd
 import numpy as np
 from collections import OrderedDict
-from datetime import date
+from datetime import date, datetime, timezone
+import hashlib
 
 router = APIRouter()
 
@@ -14,6 +22,35 @@ MONTHS = [
 ]
 DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 RISK_LABELS = ["Normal", "Alert", "Warning", "Critical"]
+SCENARIO_CONFIG: dict[WeatherScenario, dict[str, float]] = {
+    "normal": {
+        "rain_multiplier": 1.0,
+        "rain_offset": 0.0,
+        "storm_multiplier": 1.0,
+        "soil_offset": 0.0,
+        "temperature_offset": 0.0,
+        "pressure_offset": 0.0,
+        "wind_multiplier": 1.0,
+    },
+    "la_nina": {
+        "rain_multiplier": 1.85,
+        "rain_offset": 12.0,
+        "storm_multiplier": 1.55,
+        "soil_offset": 0.12,
+        "temperature_offset": -1.0,
+        "pressure_offset": -260.0,
+        "wind_multiplier": 1.25,
+    },
+    "el_nino": {
+        "rain_multiplier": 0.32,
+        "rain_offset": -6.0,
+        "storm_multiplier": 0.45,
+        "soil_offset": -0.13,
+        "temperature_offset": 2.3,
+        "pressure_offset": 210.0,
+        "wind_multiplier": 0.8,
+    },
+}
 
 
 def _map_proba_to_level(proba: float) -> int:
@@ -60,6 +97,116 @@ def _seasonal_features(n: int, start_doy: int = 1, seed: int = 42) -> pd.DataFra
             'slope_runoff_potential': float(rng.uniform(0.2, 0.8)),
         })
     return pd.DataFrame(rows)
+
+
+def _stable_seed(*parts: object) -> int:
+    key = "|".join(str(p) for p in parts)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+def _parse_timestamp(value: str) -> datetime:
+    try:
+        cleaned = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(cleaned)
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _terrain_for_node(
+    node_id: str,
+    lat: float | None,
+    lng: float | None,
+    elevation: float | None,
+    slope: float | None,
+) -> tuple[float, float]:
+    seed = _stable_seed("terrain", node_id, round(lat or 0.0, 4), round(lng or 0.0, 4))
+    rng = np.random.RandomState(seed)
+
+    if elevation is None:
+        # Sabah/Sarawak river nodes are often lowland, with some hilly interiors.
+        loc_hint = abs((lat or 0.0) * 17.0 + (lng or 0.0) * 3.0) % 1
+        elevation = float(8.0 + loc_hint * 95.0 + rng.uniform(0, 35))
+
+    if slope is None:
+        slope = float(0.8 + (elevation / 180.0) * 5.0 + rng.uniform(0, 3.5))
+
+    return round(float(elevation), 2), round(float(slope), 2)
+
+
+def _scenario_features_for_node(
+    scenario: WeatherScenario,
+    ts: datetime,
+    node_id: str,
+    water_level: int,
+    lat: float | None,
+    lng: float | None,
+    elevation: float | None = None,
+    slope: float | None = None,
+) -> dict[str, float]:
+    cfg = SCENARIO_CONFIG[scenario]
+    seed = _stable_seed(scenario, ts.isoformat(), node_id)
+    rng = np.random.RandomState(seed)
+    doy = ts.timetuple().tm_yday
+    hour = ts.hour
+
+    monsoon = 0.4 + 0.6 * (np.sin(2 * np.pi * (doy - 30) / 365) ** 2)
+    diurnal_heat = np.sin(2 * np.pi * (hour - 6) / 24)
+    terrain_elevation, terrain_slope = _terrain_for_node(node_id, lat, lng, elevation, slope)
+
+    base_rain = monsoon * 22.0 + rng.gamma(shape=1.8, scale=4.2)
+    convective_burst = rng.gamma(shape=2.0, scale=8.0) if rng.rand() < (0.06 + monsoon * 0.05) else 0.0
+    rain_1day = max(
+        0.0,
+        (base_rain + convective_burst) * cfg["rain_multiplier"] + cfg["rain_offset"] + rng.normal(0, 2.8),
+    )
+    water_boost = max(0, water_level - 1) * 12.0
+    rain_1day += water_boost
+
+    rain_3day = rain_1day * (2.0 + monsoon * 0.9) + rng.uniform(0, 12)
+    rain_5day = rain_1day * (3.2 + monsoon * 1.1) + rng.uniform(0, 22)
+    rain_7day = rain_1day * (4.4 + monsoon * 1.35) + rng.uniform(0, 34)
+    rain_avg = rain_7day / 7.0
+
+    u10 = float(rng.normal(0, 2.7) * cfg["wind_multiplier"])
+    v10 = float(rng.normal(0, 2.7) * cfg["wind_multiplier"])
+    wind_speed = float(np.sqrt(u10 * u10 + v10 * v10))
+    storm_intensity = _clamp(
+        ((rain_1day / 95.0) + (wind_speed / 24.0) + monsoon * 0.35) * cfg["storm_multiplier"],
+        0.0,
+        1.0,
+    )
+    swvl1 = _clamp(0.18 + monsoon * 0.18 + rain_7day / 900.0 + cfg["soil_offset"], 0.03, 0.5)
+    tp = max(0.0, rain_1day * 0.78 + rng.normal(0, 2.0))
+    runoff_factor = 0.18 + swvl1 * 0.55 + terrain_slope / 40.0
+    ro = max(0.0, tp * runoff_factor)
+    slope_runoff_potential = _clamp((terrain_slope / 18.0) * (0.45 + swvl1) + water_level * 0.08, 0.05, 1.0)
+    t2m = float(28.1 + diurnal_heat * 2.2 - monsoon * 1.2 + cfg["temperature_offset"] - terrain_elevation / 180.0)
+    sp = float(101325.0 + cfg["pressure_offset"] - storm_intensity * 360.0 + rng.normal(0, 160))
+
+    return {
+        "rain_1day": round(rain_1day, 2),
+        "elevation": terrain_elevation,
+        "slope": terrain_slope,
+        "u10": round(u10, 2),
+        "v10": round(v10, 2),
+        "t2m": round(t2m, 2),
+        "sp": round(sp, 2),
+        "tp": round(tp, 2),
+        "ro": round(ro, 2),
+        "swvl1": round(swvl1, 3),
+        "rain_3day": round(rain_3day, 2),
+        "rain_5day": round(rain_5day, 2),
+        "rain_7day": round(rain_7day, 2),
+        "rain_avg": round(rain_avg, 2),
+        "wind_speed": round(wind_speed, 2),
+        "storm_intensity": round(storm_intensity, 3),
+        "slope_runoff_potential": round(slope_runoff_potential, 3),
+    }
 
 
 @router.get("/predict/daily", summary="365-day flood risk predictions")
@@ -232,6 +379,57 @@ async def predict_node(body: NodePredictRequest) -> NodePredictResponse:
         probability=result['probability'],
         risk_label=RISK_LABELS[result['level']],
         model_used="xgboost" if is_model_loaded() else "rule-based-fallback",
+    )
+
+
+@router.post(
+    "/predict/nodes",
+    response_model=BatchNodesPredictResponse,
+    summary="Predict flood risk for IoT nodes using a weather scenario",
+)
+async def predict_nodes(body: BatchNodesPredictRequest) -> BatchNodesPredictResponse:
+    ts = _parse_timestamp(body.timestamp)
+    rows = []
+    metadata = []
+
+    for node in body.nodes:
+        water_level = node.water_level or 0
+        features = _scenario_features_for_node(
+            body.scenario,
+            ts,
+            node.node_id,
+            water_level,
+            node.lat,
+            node.lng,
+            node.elevation,
+            node.slope,
+        )
+        rows.append(features)
+        metadata.append((node, water_level, features))
+
+    predictions = predict_flood_risk(pd.DataFrame(rows, columns=FEATURES)) if rows else []
+
+    return BatchNodesPredictResponse(
+        scenario=body.scenario,
+        timestamp=body.timestamp,
+        predictions=[
+            BatchNodePrediction(
+                node_id=node.node_id,
+                village_id=node.village_id,
+                water_level=water_level,
+                lat=node.lat,
+                lng=node.lng,
+                status=node.status,
+                predicted_level=pred["level"],
+                probability=round(float(pred["probability"]), 2),
+                risk_label=RISK_LABELS[pred["level"]],
+                model_used="xgboost" if is_model_loaded() else "rule-based-fallback",
+                features=features,
+            )
+            for (node, water_level, features), pred in zip(metadata, predictions)
+        ],
+        model_loaded=is_model_loaded(),
+        model_version="multi-model-v2.0",
     )
 
 

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Literal, Optional
 
 
 class NodePredictRequest(BaseModel):
@@ -22,6 +22,48 @@ class NodePredictResponse(BaseModel):
     probability: float
     risk_label: str
     model_used: str
+
+
+WeatherScenario = Literal["normal", "la_nina", "el_nino"]
+
+
+class BatchNodeInput(BaseModel):
+    node_id: str
+    village_id: Optional[str] = None
+    water_level: Optional[int] = Field(0, ge=0, le=3)
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    elevation: Optional[float] = None
+    slope: Optional[float] = None
+    status: Optional[str] = None
+
+
+class BatchNodesPredictRequest(BaseModel):
+    scenario: WeatherScenario = "normal"
+    timestamp: str = Field(..., examples=["2026-05-20T12:00:00Z"])
+    nodes: list[BatchNodeInput]
+
+
+class BatchNodePrediction(BaseModel):
+    node_id: str
+    village_id: Optional[str] = None
+    water_level: int
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    status: Optional[str] = None
+    predicted_level: int
+    probability: float
+    risk_label: str
+    model_used: str
+    features: dict[str, float]
+
+
+class BatchNodesPredictResponse(BaseModel):
+    scenario: WeatherScenario
+    timestamp: str
+    predictions: list[BatchNodePrediction]
+    model_loaded: bool
+    model_version: str
 
 
 class HealthResponse(BaseModel):
