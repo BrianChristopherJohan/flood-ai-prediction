@@ -174,8 +174,28 @@ def _rule_based(df: pd.DataFrame) -> list[dict]:
     """Conservative physics-based fallback when no ML model is available."""
     results = []
     for _, row in df.iterrows():
-        rain = float(row.get("rain_1day", 0)) + float(row.get("rain_3day", 0)) * 0.3
-        proba = min(100.0, max(0.0, rain * 1.8))
+        rain_1day = float(row.get("rain_1day", 0))
+        rain_3day = float(row.get("rain_3day", 0))
+        rain_7day = float(row.get("rain_7day", 0))
+        runoff = float(row.get("ro", 0))
+        soil = float(row.get("swvl1", 0))
+        storm = float(row.get("storm_intensity", 0))
+        slope_runoff = float(row.get("slope_runoff_potential", 0))
+
+        # Calibrated to preserve scenario separation for demos:
+        # El Nino should mostly sit in Normal/Alert, normal monsoon in
+        # Alert/Warning, and La Nina/wet events should push into Critical.
+        proba = (
+            rain_1day * 0.45
+            + rain_3day * 0.08
+            + rain_7day * 0.025
+            + runoff * 0.7
+            + storm * 18.0
+            + soil * 22.0
+            + slope_runoff * 10.0
+            - 18.0
+        )
+        proba = min(100.0, max(0.0, proba))
         results.append({
             "level": _map_proba_to_level(proba),
             "probability": round(proba, 1),
